@@ -1,0 +1,620 @@
+package com.example.healthchatbot
+
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.net.Uri
+import android.os.Bundle
+import android.util.Log
+import android.view.View
+import android.widget.Toast
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.example.healthchatbot.adapter.ChatAdapter
+import com.example.healthchatbot.databinding.ActivityMainBinding
+import com.runanywhere.sdk.public.RunAnywhere
+import com.runanywhere.sdk.public.extensions.listAvailableModels
+import com.runanywhere.sdk.public.extensions.addModelFromURL
+import com.runanywhere.sdk.data.models.SDKEnvironment
+import com.runanywhere.sdk.llm.llamacpp.LlamaCppServiceProvider
+import kotlinx.coroutines.*
+import java.io.PrintWriter
+import java.io.StringWriter
+
+class MainActivity : AppCompatActivity() {
+    private lateinit var binding: ActivityMainBinding
+    private val viewModel: HealthChatViewModel by viewModels()
+    private lateinit var chatAdapter: ChatAdapter
+
+    private val pdfPickerLauncher = registerForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        uri?.let { processPdf(it) }
+    }
+
+    private val documentPicker =
+        registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+            uri?.let { processPdf(uri) }
+        }
+
+    private val storagePermissionRequest = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (isGranted) {
+            documentPicker.launch("application/pdf")
+        } else {
+            Toast.makeText(this, "Permission denied", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // Track SDK state
+    private var isSDKInitialized = false
+    private var isModelDownloaded = false
+    private var isModelLoaded = false
+    private var initializationJob: Job? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        Thread.setDefaultUncaughtExceptionHandler { thread, exception ->
+            logError("UNCAUGHT EXCEPTION", exception)
+            runOnUiThread {
+                showError("App Error: ${exception.message}")
+            }
+        }
+
+        try {
+            Log.d("HealthChatbot", "=== APP STARTING ===")
+            binding = ActivityMainBinding.inflate(layoutInflater)
+            setContentView(binding.root)
+
+            setupRecyclerView()
+            setupClickListeners()
+            observeViewModel()
+
+            // Show initial status
+            updateStatus("Health Chatbot Ready - Click Download to start")
+
+            Log.d("HealthChatbot", "MainActivity onCreate completed successfully")
+
+        } catch (e: Exception) {
+            logError("onCreate Error", e)
+            showError("Failed to initialize app: ${e.message}")
+        }
+    }
+
+    private fun logError(tag: String, exception: Throwable) {
+        val sw = StringWriter()
+        val pw = PrintWriter(sw)
+        exception.printStackTrace(pw)
+        val stackTrace = sw.toString()
+
+        Log.e("HealthChatbot", "=== $tag ===")
+        Log.e("HealthChatbot", "Message: ${exception.message}")
+        Log.e("HealthChatbot", "Cause: ${exception.cause}")
+        Log.e("HealthChatbot", "Stack Trace: $stackTrace")
+        Log.e("HealthChatbot", "=== END $tag ===")
+    }
+
+    private fun showError(message: String) {
+        runOnUiThread {
+            Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+            updateStatus("Error: $message")
+        }
+    }
+
+    private fun updateStatus(message: String) {
+        runOnUiThread {
+            binding.textViewStatus.text = message
+            Log.d("HealthChatbot", "Status: $message")
+        }
+    }
+
+    private fun setupRecyclerView() {
+        try {
+            chatAdapter = ChatAdapter()
+            binding.recyclerViewChat.layoutManager = LinearLayoutManager(this)
+            binding.recyclerViewChat.adapter = chatAdapter
+            Log.d("HealthChatbot", "RecyclerView setup completed")
+        } catch (e: Exception) {
+            logError("RecyclerView Setup Error", e)
+        }
+    }
+
+    private fun setupClickListeners() {
+        try {
+            binding.buttonSend.setOnClickListener {
+                try {
+                    val message = binding.editTextMessage.text.toString().trim()
+                    if (message.isNotEmpty()) {
+                        Log.d("HealthChatbot", "Sending message: $message")
+                        sendMessage(message)
+                        binding.editTextMessage.text?.clear()
+                    }
+                } catch (e: Exception) {
+                    logError("Send Button Error", e)
+                    showError("Send failed: ${e.message}")
+                }
+            }
+
+            binding.buttonUpload.setOnClickListener {
+                try {
+                    Log.d("HealthChatbot", "Upload button clicked")
+                    checkStoragePermissionAndUpload()
+                } catch (e: Exception) {
+                    logError("Upload Button Error", e)
+                    showError("Upload failed: ${e.message}")
+                }
+            }
+
+            binding.buttonDownloadModel.setOnClickListener {
+                try {
+                    Log.d("HealthChatbot", "Download button clicked")
+                    downloadModel()
+                } catch (e: Exception) {
+                    logError("Download Button Error", e)
+                    showError("Download failed: ${e.message}")
+                }
+            }
+
+            binding.buttonLoadModel.setOnClickListener {
+                try {
+                    Log.d("HealthChatbot", "Load button clicked")
+                    loadModel()
+                } catch (e: Exception) {
+                    logError("Load Button Error", e)
+                    showError("Load failed: ${e.message}")
+                }
+            }
+
+            Log.d("HealthChatbot", "Click listeners setup completed")
+        } catch (e: Exception) {
+            logError("Click Listeners Setup Error", e)
+        }
+    }
+
+    private fun observeViewModel() {
+        try {
+            lifecycleScope.launch {
+                viewModel.messages.collect { messages ->
+                    chatAdapter.submitList(messages)
+                    if (messages.isNotEmpty()) {
+                        binding.recyclerViewChat.smoothScrollToPosition(messages.size - 1)
+                    }
+                }
+            }
+
+            lifecycleScope.launch {
+                viewModel.isLoading.collect { isLoading ->
+                    binding.progressBar.visibility = if (isLoading) View.VISIBLE else View.GONE
+                    binding.buttonSend.isEnabled = !isLoading
+                }
+            }
+
+            lifecycleScope.launch {
+                viewModel.error.collect { error ->
+                    error?.let {
+                        Toast.makeText(this@MainActivity, it, Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+
+            Log.d("HealthChatbot", "ViewModel observers setup completed")
+        } catch (e: Exception) {
+            logError("ViewModel Observer Setup Error", e)
+        }
+    }
+
+    private suspend fun initializeSDKIfNeeded(): Boolean {
+        if (HealthChatbotApplication.isSDKInitialized) {
+            Log.d("HealthChatbot", "SDK already initialized")
+            return true
+        }
+
+        if (HealthChatbotApplication.isInitializing) {
+            Log.w("HealthChatbot", "SDK initialization already in progress, waiting...")
+            while (HealthChatbotApplication.isInitializing && !HealthChatbotApplication.isSDKInitialized) {
+                delay(100)
+            }
+            return HealthChatbotApplication.isSDKInitialized
+        }
+
+        HealthChatbotApplication.isInitializing = true
+
+        return try {
+            withContext(Dispatchers.Main) {
+                binding.textViewStatus.text = "⏳ Initializing RunAnywhere SDK..."
+            }
+
+            Log.d("HealthChatbot", "Starting REAL RunAnywhere SDK initialization...")
+
+            withContext(Dispatchers.IO) {
+                try {
+                    Log.d("HealthChatbot", "Checking for required serialization dependencies...")
+                    try {
+                        Class.forName("kotlinx.serialization.json.JsonKt")
+                        Class.forName("kotlinx.serialization.json.Json")
+                        Log.d("HealthChatbot", "Kotlinx-serialization dependencies found")
+                    } catch (serializationMissing: ClassNotFoundException) {
+                        Log.e(
+                            "HealthChatbot",
+                            "Kotlinx-serialization dependencies missing",
+                            serializationMissing
+                        )
+                        throw Exception("Required serialization libraries missing - cannot initialize SDK")
+                    }
+
+                    Log.d("HealthChatbot", "Initializing RunAnywhere SDK...")
+
+                    RunAnywhere.initialize(
+                        context = applicationContext,
+                        apiKey = "dev-api-key",
+                        environment = SDKEnvironment.DEVELOPMENT
+                    )
+                    Log.d("HealthChatbot", "RunAnywhere.initialize() completed")
+
+                    delay(2000)
+
+                    Log.d("HealthChatbot", "Registering LlamaCpp service provider...")
+                    LlamaCppServiceProvider.register()
+                    Log.d("HealthChatbot", "LlamaCppServiceProvider.register() completed")
+
+                    delay(2000)
+
+                    Log.d("HealthChatbot", "Adding model from URL...")
+                    addModelFromURL(
+                        url = "https://huggingface.co/prithivMLmods/SmolLM2-360M-GGUF/resolve/main/SmolLM2-360M.Q8_0.gguf",
+                        name = "SmolLM2-360M-Q8_0",
+                        type = "LLM"
+                    )
+                    Log.d("HealthChatbot", "addModelFromURL() completed")
+
+                    delay(1000)
+
+                    Log.d("HealthChatbot", "Scanning for downloaded models...")
+                    RunAnywhere.scanForDownloadedModels()
+                    Log.d("HealthChatbot", "scanForDownloadedModels() completed")
+
+                    true
+                } catch (e: Exception) {
+                    Log.e("HealthChatbot", "SDK initialization failed", e)
+                    false
+                }
+            }.also { success ->
+                withContext(Dispatchers.Main) {
+                    if (success) {
+                        binding.textViewStatus.text = "✅ RunAnywhere SDK Initialized Successfully!"
+                        HealthChatbotApplication.isSDKInitialized = true
+                        HealthChatbotApplication.initializationError = null
+                        Log.i("HealthChatbot", "REAL SDK initialization completed successfully!")
+                    } else {
+                        val errorMsg = "RunAnywhere SDK initialization failed"
+                        binding.textViewStatus.text = "❌ $errorMsg"
+                        HealthChatbotApplication.initializationError = errorMsg
+                        Log.e("HealthChatbot", errorMsg)
+                    }
+                }
+                success
+            }
+        } catch (t: Throwable) {
+            Log.e("HealthChatbot", "SDK initialization crashed", t)
+            withContext(Dispatchers.Main) {
+                val errorMsg = "SDK initialization crashed: ${t.localizedMessage}"
+                binding.textViewStatus.text = "❌ $errorMsg"
+                HealthChatbotApplication.initializationError = errorMsg
+            }
+            false
+        } finally {
+            HealthChatbotApplication.isInitializing = false
+        }
+    }
+
+    private fun sendMessage(text: String) {
+        try {
+            Log.d("HealthChatbot", "Sending message to ViewModel: $text")
+            lifecycleScope.launch {
+                try {
+                    viewModel.sendMessage(text)
+                } catch (e: Exception) {
+                    logError("Send Message Error", e)
+                    showError("Message send failed: ${e.message}")
+                }
+            }
+        } catch (e: Exception) {
+            logError("Send Message Setup Error", e)
+            showError("Message setup failed: ${e.message}")
+        }
+    }
+
+    private fun downloadModel() {
+        if (binding.buttonDownloadModel.text != "Download Model") {
+            return
+        }
+
+        if (!isNetworkAvailable()) {
+            Toast.makeText(this, "No internet connection", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        lifecycleScope.launch {
+            try {
+                binding.buttonDownloadModel.isEnabled = false
+                binding.buttonDownloadModel.text = "Initializing..."
+
+                Log.d("HealthChatbot", "Starting REAL model download process...")
+
+                val sdkReady = initializeSDKIfNeeded()
+
+                if (!sdkReady) {
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(
+                            this@MainActivity,
+                            "SDK initialization failed",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                        binding.buttonDownloadModel.text = "Download Model"
+                        binding.buttonDownloadModel.isEnabled = true
+                    }
+                    return@launch
+                }
+
+                withContext(Dispatchers.IO) {
+                    try {
+                        withContext(Dispatchers.Main) {
+                            binding.textViewStatus.text = "Fetching available models..."
+                            binding.buttonDownloadModel.text = "Fetching..."
+                        }
+
+                        delay(1000)
+
+                        Log.d("HealthChatbot", "Calling listAvailableModels()...")
+                        val models = listAvailableModels()
+                        Log.d("HealthChatbot", "Found ${models.size} models")
+
+                        if (models.isNotEmpty()) {
+                            val modelId = models[0].id
+                            Log.d("HealthChatbot", "Starting download for model: $modelId")
+
+                            withContext(Dispatchers.Main) {
+                                binding.textViewStatus.text = "Downloading model..."
+                                binding.buttonDownloadModel.text = "Downloading... 0%"
+                            }
+
+                            var lastProgress = 0
+                            RunAnywhere.downloadModel(modelId).collect { progress ->
+                                val percentage = (progress * 100).toInt()
+                                if (percentage != lastProgress) {
+                                    lastProgress = percentage
+                                    withContext(Dispatchers.Main) {
+                                        binding.buttonDownloadModel.text =
+                                            "Downloading... $percentage%"
+                                        Log.d(
+                                            "HealthChatbot",
+                                            "Real download progress: $percentage%"
+                                        )
+                                    }
+                                }
+                            }
+
+                            withContext(Dispatchers.Main) {
+                                binding.textViewStatus.text = "✅ Model downloaded successfully!"
+                                Toast.makeText(
+                                    this@MainActivity,
+                                    "REAL model download completed!",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                        } else {
+                            withContext(Dispatchers.Main) {
+                                binding.textViewStatus.text = "❌ No models available for download"
+                                Toast.makeText(
+                                    this@MainActivity,
+                                    "No models found - check model registration",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.e("HealthChatbot", "Real download failed", e)
+                        withContext(Dispatchers.Main) {
+                            binding.textViewStatus.text = "❌ Download failed: ${e.localizedMessage}"
+                            Toast.makeText(
+                                this@MainActivity,
+                                "Download failed: ${e.localizedMessage}",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
+                    }
+                }
+            } catch (t: Throwable) {
+                Log.e("HealthChatbot", "Download process error", t)
+                withContext(Dispatchers.Main) {
+                    binding.textViewStatus.text = "❌ Download error: ${t.localizedMessage}"
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Download error: ${t.localizedMessage}",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            } finally {
+                binding.buttonDownloadModel.text = "Download Model"
+                binding.buttonDownloadModel.isEnabled = true
+            }
+        }
+    }
+
+    private fun loadModel() {
+        if (binding.buttonLoadModel.text != "Load Model") {
+            return
+        }
+
+        lifecycleScope.launch {
+            try {
+                binding.buttonLoadModel.isEnabled = false
+                binding.buttonLoadModel.text = "Initializing..."
+
+                Log.d("HealthChatbot", "Starting REAL model load process...")
+
+                val sdkReady = initializeSDKIfNeeded()
+
+                if (!sdkReady) {
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(
+                            this@MainActivity,
+                            "SDK initialization failed",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                        binding.buttonLoadModel.text = "Load Model"
+                        binding.buttonLoadModel.isEnabled = true
+                    }
+                    return@launch
+                }
+
+                withContext(Dispatchers.IO) {
+                    try {
+                        withContext(Dispatchers.Main) {
+                            binding.textViewStatus.text = "Loading model..."
+                            binding.buttonLoadModel.text = "Loading..."
+                        }
+
+                        delay(1000)
+
+                        val models = listAvailableModels()
+                        if (models.isNotEmpty()) {
+                            val modelId = models[0].id
+                            Log.d("HealthChatbot", "Loading REAL model: $modelId")
+                            val success = RunAnywhere.loadModel(modelId)
+
+                            withContext(Dispatchers.Main) {
+                                if (success) {
+                                    binding.textViewStatus.text =
+                                        "✅ REAL AI Model loaded and ready!"
+                                    binding.editTextMessage.hint = "Ask me about your health..."
+                                    Toast.makeText(
+                                        this@MainActivity,
+                                        "REAL AI model loaded successfully!",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                    isModelLoaded = true
+                                } else {
+                                    binding.textViewStatus.text = "❌ Failed to load model"
+                                    Toast.makeText(
+                                        this@MainActivity,
+                                        "Load failed - download model first",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                }
+                            }
+                        } else {
+                            withContext(Dispatchers.Main) {
+                                binding.textViewStatus.text = "❌ No models found"
+                                Toast.makeText(
+                                    this@MainActivity,
+                                    "No models found - download first",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.e("HealthChatbot", "Real load failed", e)
+                        withContext(Dispatchers.Main) {
+                            binding.textViewStatus.text = "❌ Load failed: ${e.localizedMessage}"
+                            Toast.makeText(
+                                this@MainActivity,
+                                "Load failed: ${e.localizedMessage}",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
+                    }
+                }
+            } catch (t: Throwable) {
+                Log.e("HealthChatbot", "Load process error", t)
+                withContext(Dispatchers.Main) {
+                    binding.textViewStatus.text = "❌ Load error: ${t.localizedMessage}"
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Load error: ${t.localizedMessage}",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            } finally {
+                binding.buttonLoadModel.text = "Load Model"
+                binding.buttonLoadModel.isEnabled = true
+            }
+        }
+    }
+
+    private fun checkStoragePermissionAndUpload() {
+        try {
+            when {
+                ContextCompat.checkSelfPermission(
+                    this,
+                    Manifest.permission.READ_EXTERNAL_STORAGE
+                ) == PackageManager.PERMISSION_GRANTED -> {
+                    documentPicker.launch("application/pdf")
+                }
+
+                else -> {
+                    storagePermissionRequest.launch(Manifest.permission.READ_EXTERNAL_STORAGE)
+                }
+            }
+        } catch (e: Exception) {
+            logError("Storage Permission Error", e)
+            showError("Permission check failed: ${e.message}")
+        }
+    }
+
+    private fun processPdf(uri: Uri) {
+        try {
+            Log.d("HealthChatbot", "Processing PDF: $uri")
+            lifecycleScope.launch {
+                try {
+                    viewModel.processPdf(this@MainActivity, uri)
+                    showError("PDF processed successfully!")
+                } catch (e: Exception) {
+                    logError("PDF Processing Error", e)
+                    showError("PDF processing failed: ${e.message}")
+                }
+            }
+        } catch (e: Exception) {
+            logError("PDF Processing Setup Error", e)
+            showError("PDF processing setup failed: ${e.message}")
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == PERMISSION_REQUEST_CODE) {
+            if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                pdfPickerLauncher.launch("application/pdf")
+            } else {
+                Toast.makeText(this, "Permission denied", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    private fun isNetworkAvailable(): Boolean {
+        return try {
+            val connectivityManager =
+                getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val activeNetwork = connectivityManager.activeNetwork
+            val networkCapabilities = connectivityManager.getNetworkCapabilities(activeNetwork)
+            networkCapabilities != null && networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        } catch (e: Exception) {
+            Log.w("HealthChatbot", "Failed to check network", e)
+            false
+        }
+    }
+
+    companion object {
+        private const val PERMISSION_REQUEST_CODE = 100
+    }
+}
